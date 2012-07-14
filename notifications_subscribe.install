@@ -1,0 +1,16 @@
+<?php
+// $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/notifications_subscribe.install#1 $
+/**
+ * @file
+ * Install routines for SMS follow.
+ */
+
+/**
+ * Implementation of hook_install()
+ *
+ * Adjust weighting slightly so module can revert some of the form changes 
+ * made by notifications module.
+ */
+function notifications_subscribe_install() {
+  db_query("UPDATE {system} SET weight = 2 WHERE type = 'module' AND  name = 'notifications_subscribe'");
+}

@@ -1,0 +1,8 @@
+; $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/notifications_subscribe.info#1 $
+name = SMS Follow News
+description = Morphs notifications into the Follow News functionality.
+package = "Notifications"
+dependencies[] = notifications
+dependencies[] = ctools
+dependencies[] = calais
+core = 6.x

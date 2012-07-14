@@ -1,0 +1,117 @@
+<?php
+// $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/notifications_revision/notifications_revision.module#1 $
+/**
+ * @file
+ * Adds notifications event for node updates that create a new revision.
+ */
+
+/**
+ * Implementation of hook_notifications()
+ */
+function notifications_revision_notifications($op) {
+  switch ($op) {
+    case 'event types':
+      $types['node-revision'] = array(
+        'type' => 'node',
+        'action' => 'revision',
+        'name' => t('[type-name]: [title]'),
+        'line' => t('The [type-name] has been revised'),
+        'digest' => array('node', 'nid'), 
+        'description' => t('Node revision'),
+        'template' => 'notifications-event-node-revision',
+      );
+      return $types;
+      break;
+
+    case 'event actions':
+      return array('revision' => t('Revision'));
+      break;
+  }
+}
+
+/**
+ * Implementation of hook_notificiations_templates()
+ *
+ * Describes the templates used by node revision events.
+ */
+function notifications_revision_notifications_templates($op, $type = 'all', $language = NULL) {
+  switch ($op) {
+    case 'info':
+      $info = array();
+      if ('all' == $type || 'notifications-event-node-revision' == $type) {
+        $info['notifications-event-node-revision'] = array(
+          'module' => 'notifications_revision',
+          'name' => t('Notifications for node revisions'),
+          'description' => t('Notifications produced when a node is updated to produce a new revision.'),
+          'fallback' => 'notifications-event-node',
+        );
+      }
+      return $info;
+      break;
+      
+    case 'parts':
+      if ('notifications-event-node-revision' == $type) {
+        return array(
+          'subject' => t('Subject'),
+          'main' => t('Content'),
+          'digest' => t('Digest line'),
+        );
+      }
+      break;
+
+    case 'defaults':
+      if ('notifications-event-node-revision' == $type) {
+        $lang = is_object($language) ? $language->language : NULL;
+        return array(
+          'subject' => t('Revision for [type-name]: [title]', array(), $lang),
+          'main' => array(
+            '[node-teaser]',
+            t('Read more [node-url]', array(), $lang),
+          ),
+          'digest' => array(
+            '[title]',
+            t('Read more [node-url]', array(), $lang),
+          ),
+        );
+      }
+      break;
+  }
+}
+
+/**
+ * Implementation of hook_nodeapi()
+ *
+ */
+function notifications_revision_nodeapi(&$node, $op, $arg3, $arg4) {
+  global $user;
+  // notifications_content uses static storage to make sure it doesn't send notifications
+  // more than once if node_save() happens to be called multiple times on the same node.
+  $done = &messaging_static(__FUNCTION__);
+
+  switch ($op) {
+    case 'update':
+      if (!isset($done[$node->nid])
+          && $node->status 
+          && $node->revision
+          && empty($node->notifications_content_disable)
+          && notifications_content_type_enabled($node->type)
+          ) {
+        $done[$node->nid] = TRUE;
+        $event = array(
+          'module' => 'node',
+          'oid' => $node->nid,
+          'type' => 'node',
+          'action' => 'revision',
+          //'node' => $node,
+          'params' => array('nid' => $node->nid),      
+        );
+        // If immediate sending is active, need to reset the node cache so we don't send old versions of the node
+        if (variable_get('notifications_send_immediate', 0)) {
+          node_load(FALSE, NULL, TRUE);
+        }
+        // Build and trigger the event
+        notifications_event($event, array('node' => $node));
+      }
+      break;
+  }
+}

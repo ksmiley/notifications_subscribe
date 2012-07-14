@@ -1,0 +1,78 @@
+/* $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/css/manage-subs.css#1 $ */
+/**
+ * @file
+ *
+ * Style the table on the "followed topics" user tab.
+ */
+
+#manage-subscriptions td.sub-type {
+  font-family: helvetica,arial,sans-serif;
+  font-size: 12px;
+  font-weight: bold;
+  text-align: right;
+  vertical-align: middle;
+}
+
+#manage-subscriptions td.sub-name {
+  font-family: georgia,serif;
+  font-size: 14px;
+}
+
+#manage-subscriptions td.sub-actions {
+  font-family: helvetica,arial,sans-serif;
+  font-size: 12px;
+  text-align: left;
+}
+
+#manage-subscriptions td.sub-actions.sub-action-restore {
+  text-align: center;
+}
+
+#manage-subscriptions td.sub-message {
+  font-family: helvetica,arial,sans-serif;
+  font-size: 12px;
+}
+
+#manage-subscriptions td.sub-action-restore {
+  font-weight: bold;
+}
+
+#manage-subscriptions tr.even {
+  background-color: #f2f2f2;
+}
+
+#manage-subscriptions tr.odd {
+  background-color: #fafafa;
+}
+
+#manage-subscriptions tr.sub-removed, #manage-subscriptions tr.sub-removed.changed {
+  background-color: #ff8080;
+}
+
+#manage-subscriptions tr.changed {
+  background-color: #deeadb;
+  color: black;
+}
+
+#manage-subscriptions tr.sub-active td.sub-type {
+  color: #000;
+}
+
+#manage-subscriptions tr.sub-inactive td.sub-type {
+  color: #999;
+}
+
+th.sub-type, th.sub-name, th.sub-actions {
+  padding: 8px;
+  font-size: 12px;
+  font-family: georgia,serif;
+  color: #444;
+}
+
+th.sub-actions {
+  text-align: center;
+}
+
+th.sub-type {
+  text-align: right;
+}

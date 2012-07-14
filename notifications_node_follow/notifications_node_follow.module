@@ -1,0 +1,432 @@
+<?php
+// $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/notifications_node_follow/notifications_node_follow.module#1 $
+/**
+ * @file
+ * Subscriptions to node follow-ups, using CCK nodereference fields.
+ *
+ * @todo Should detect when a content type or field is removed from a content type, in case the noderef field disappears.
+ *       (using hook_node_type()?)
+ */
+
+/**
+ * Implementation of hook_form_alter().
+ * 
+ * Modify notifcations_content admin form to add configuration for which 
+ * content types and nodereference fields to make followable.
+ */
+function notifications_node_follow_form_alter(&$form, $form_state, $form_id) {
+  if ($form_id == 'notifications_content_settings_form') {
+    // Grab a list of all content types. This will be filtered down to just
+    // the types that include a nodereference field, since those are the only
+    // ones this module can handle.
+    $all_types = content_types();
+    $usable_types = array();
+    foreach ($all_types as $type) {
+      // Make sure 'fields' is an array before trying to iterate over it.
+      // This might not be needed if CCK guarantees it'll always exist and
+      // be an array.
+      if (isset($type['fields']) && is_array($type['fields'])) {
+        foreach ($type['fields'] as $field) {
+          if ($field['type'] == 'nodereference') {
+            $usable_types[$type['type']][$field['field_name']] = $field['field_name'];
+          }
+        }
+      }
+    }
+    $form['follow'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Followable types'),
+      '#description' => t('For a content type to appear here, it must have at least one CCK nodereference field. When new content is posted, the selected nodereference fields will be used to build up a "chain" of nodes, and anyone subscribed to any of those nodes will receive a notification.'),
+      '#collapsible' => TRUE,
+    );
+    if ($usable_types) {
+      foreach ($usable_types as $type => $fields) {
+        $form['follow']['notifications_node_follow_type_' . $type] = array(
+          '#type' => 'checkboxes',
+          '#title' => $all_types[$type]['name'],
+          '#default_value' => variable_get('notifications_node_follow_type_' . $type, array()),
+          '#options' => $fields,
+          '#multiple' => TRUE,
+        );
+      }
+    } else {
+      $content_link = l(t('Edit content types'), 'admin/content/types');
+      $form['follow']['disabled'] = array(
+        '#value' => t('None of the current content types can be used. To enable follow-up notifications, add a nodereference field to at least one content type: !link', array('!link' => $content_link)),
+      );
+    }
+  }
+}
+
+/**
+ * Implementation of hook_notifications()
+ */
+function notifications_node_follow_notifications($op) {
+  switch ($op) {
+    case 'subscription types':
+      $types['follow'] = array(
+        'event_type' => 'node',
+        'object_type' => 'node',
+        'title' => t('Follow-ups'),
+        'access' => 'subscribe to content',
+        'user page' => 'user/%user/notifications/follow',
+        'fields' => array('nid'),
+        'description' => t('Subscribe to new nodes marked as follow-ups to a node.'),
+        'name callback' => 'notifications_content_subscription_name',
+      );
+      return $types;
+      break;
+
+    case 'event types':
+      $types['node-followup'] = array(
+        'type' => 'node',
+        'action' => 'followup',
+        'name' => t('[type-name]: [title]'),
+        'line' => t('A follow-up [type-name] has been posted'),
+        'digest' => array('node', 'nid'), 
+        'description' => t('Node follow-up'),
+        'template' => 'notifications-event-node-followup',
+      );
+      return $types;
+      break;
+
+    case 'event actions':
+      return array('followup' => t('Follow-up'));
+      break;
+
+    case 'object types':
+      // Needed so Notifications_Event understands the second node object
+      // that's included in node-follow events. Except for the name, this
+      // is copied verbatim from notifications.module
+      $types['follow-node'] = array(
+        'name' => t('Follow-up Node'),
+        'key_field' => 'nid',
+        'load callback' => 'node_load',
+        'autocomplete path' => 'notifications/autocomplete/node/title',
+        'autocomplete callback' => 'notifications_node_nid2autocomplete',
+        'format callback' => 'notifications_node_nid2title',
+        'value callback' => 'notifications_node_title2nid',
+        'access callback' => 'notifications_node_user_access',
+        'module' => 'notifications',  // overriden so that node.inc can be loaded
+        'file' => 'node.inc',   // provided by notifications modules
+      );
+      return $types;
+      break;
+  }
+}
+
+/**
+ * Implementation of hook notifications_subscription()
+ *
+ * @todo Does this need more access checking? Like checking the CCK field permissions?
+ */
+/* This was copied from notifications_content, but since it's generic it probably isn't
+ * needed here. The version in noitifcations_content should still apply.
+function notifications_node_follow_notifications_subscription($op, $subscription = NULL) {
+  // Check access control for subscription
+  if ($op == 'access' && ($conditions = $subscription->get_conditions()) && !empty($conditions['type'])) {
+    // It seems to be a subscription for a content type
+    return notifications_content_type_enabled($conditions['type'], $subscription->type);
+  }
+}
+*/
+
+/**
+ * Implementation of hook_notifications_object_node()
+ */
+function notifications_node_follow_notifications_object_node($op, $node, $account = NULL) {
+  switch ($op) {
+    //case 'conditions':
+    case 'subscriptions':
+      // Return available subscription options for this node and this user account
+      $options = array();
+      // Thread
+      if (notifications_content_type_enabled($node->type, 'follow')) {
+        $options[] = array(
+          'name' => t('Follow-ups to this post'),
+          'type' => 'follow',
+          'fields' => array('nid' => $node->nid),
+        );
+      }
+      return $options;
+      break;
+  }
+}
+
+/**
+ * Implementation of hook_notifications_templates()
+ *
+ * Describes the templates used by follow-up events. Also adds a token group
+ * for use in follow templates.
+ */
+function notifications_node_follow_notifications_templates($op, $type = 'all', $language = NULL) {
+  switch ($op) {
+    case 'info':
+      $info = array();
+      if ($type == 'all' || $type == 'notifications-event-node-followup') {
+        // Generic notifications event
+        $info['notifications-event-node-followup'] = array(
+          'module' => 'notifications_node_follow',
+          'name' => t('Notifications for node follow-ups'),
+          'description' => t('Notifications produced when a follow-up to an existed node is posted.'),
+          'fallback' => 'notifications-event-node',
+        );
+      }
+      return $info;
+      break;
+
+    case 'parts':
+      if ($type == 'notifications-event-node-followup') {
+        return array(
+          'subject' => t('Subject'),
+          'main' => t('Content'),
+          'digest' => t('Digest line'),
+        );
+      }
+      break;
+
+    case 'defaults':
+      if ($type == 'notifications-event-node-followup') {
+        return array(
+          'subject' => t('Follow-up for [type-name]: [title]', array(), $language->language),
+          'main' => array(
+            '[node-teaser]',
+            t('Read more [node-url]', array(), $language->language),
+          ),
+          'digest' => array(
+            '[title]',
+            t('Read more [node-url]', array(), $language->language),
+          ),
+        );
+      }
+      break;
+
+    case 'tokens':
+      if (substr($type, 0, 33) == 'notifications-event-node-followup') {
+        return array('follow-node');
+      }
+      break;
+  }
+}
+
+/**
+ * Implementation of hook_token_list()
+ *
+ * Provides a second set of node tokens for follow-up events.
+ */
+function notifications_node_follow_token_list($type = 'all') {
+  $tokens = array();
+  if ('follow-node' == $type || 'all' == $type) {
+    // These tokens are copied from modules token and notifications_content.
+    // Would be better to ask for these at runtime, but a limitation in token
+    // causes problems.
+    $follow_descr = t('For follow-up node: ');
+    $tokens['follow-node']['follow-nid']             = $follow_descr . t('The unique ID of the content item, or "node".');
+    $tokens['follow-node']['follow-type']            = $follow_descr . t('The type of the node.');
+    $tokens['follow-node']['follow-type-name']       = $follow_descr . t('The human-readable name of the node type.');
+    $tokens['follow-node']['follow-language']        = $follow_descr . t('The language the node is written in.');
+    $tokens['follow-node']['follow-title']           = $follow_descr . t('The title of the node.');
+    $tokens['follow-node']['follow-title-raw']       = $follow_descr . t('The title of the node.');
+    $tokens['follow-node']['follow-node-path']       = $follow_descr . t('The URL alias of the node.');
+    $tokens['follow-node']['follow-node-path-raw']   = $follow_descr . t('The URL alias of the node.');
+    $tokens['follow-node']['follow-node-url']        = $follow_descr . t('The URL of the node.');
+    $tokens['follow-node']['follow-author-uid']      = $follow_descr . t("The unique ID of the author of the node.");
+    $tokens['follow-node']['follow-author-name']     = $follow_descr . t("The login name of the author of the node.");
+    $tokens['follow-node']['follow-author-name-raw'] = $follow_descr . t("The login name of the author of the node.");
+    $tokens['follow-node']['follow-author-mail']     = $follow_descr . t("The email address of the author of the node.");
+    $tokens['follow-node']['follow-author-mail-raw'] = $follow_descr . t("The email address of the author of the node.");
+    $tokens['follow-node']['follow-log']     = $follow_descr . t('The explanation of the most recent changes made to the node.');
+    $tokens['follow-node']['follow-log-raw'] = $follow_descr . t('The explanation of the most recent changes made to the node.');
+    $tokens['follow-node'] += token_get_date_token_info($follow_descr . t('Node creation'), 'follow-');
+    $tokens['follow-node'] += token_get_date_token_info($follow_descr . t('Node modification'), 'follow-mod-');
+    $tokens['follow-node']['follow-node-teaser']     = $follow_descr . t('The node teaser.');
+    $tokens['follow-node']['follow-node-body']       = $follow_descr . t('The node body.');
+    $tokens['follow-node']['follow-node-teaser-raw'] = $follow_descr . t('Unfiltered node teaser. WARNING - raw user input.');
+    $tokens['follow-node']['follow-node-body-raw']   = $follow_descr . t('Unfiltered node body. WARNING - raw user input.');
+    // offered by notifications_content, but commented out here until we need it.
+    //$tokens['follow-node']['follow-node-content']    = $follow_descr . t('The fully rendered node content.');
+
+    /* This SHOULD be doable by asking the token module for a list of
+     * node tokens, then prefixing each with "follow-". And for token_list, 
+     * this does work. But token_values doesn't allow any recursion.
+     * Leaving this code in case token module is ever updated to remove
+     * the recursion limitation.
+    $others = token_get_list('node');
+    foreach ($others['node'] as $token => $description) {
+      $tokens['follow-node']['follow-' . $token] = t('For follow-up node: ') . $description;
+    }
+    // end code that should work, but token module breaks it */
+    return $tokens;
+  }
+}
+
+/**
+ * Implementation of hook_token_values()
+ *
+ * Provides a second set of node tokens for follow-up events.
+ */
+function notifications_node_follow_token_values($type, $object = NULL, $options = array()) {
+  if ('follow-node' == $type && $node = $object) {
+    // These tokens are copied from modules token and notifications_content.
+    // Would be better to ask for these at runtime, but a limitation in token
+    // causes problems.
+    $account = db_fetch_object(db_query("SELECT name, mail FROM {users} WHERE uid = %d", $node->uid));
+
+    // Adjust for the anonymous user name.
+    if (!$node->uid && !$account->name) {
+      $account->name = variable_get('anonymous', t('Anonymous'));
+    }
+
+    $values['follow-nid']                = $node->nid;
+    $values['follow-type']               = $node->type;
+    $values['follow-type-name']          = node_get_types('name', $node->type);
+    $values['follow-language']           = filter_xss_admin($node->language);
+    $values['follow-title']              = check_plain($node->title);
+    $values['follow-title-raw']          = $node->title;
+    $values['follow-node-path-raw']      = drupal_get_path_alias('node/'. $node->nid);
+    $values['follow-node-path']          = check_plain($values['follow-node-path-raw']);
+    $values['follow-node-url']           = url('node/' . $node->nid, array('absolute' => TRUE));
+    $values['follow-author-uid']         = $node->uid;
+    $values['follow-author-name']        = check_plain($account->name);
+    $values['follow-author-name-raw']    = $account->name;
+    $values['follow-author-mail']        = check_plain($account->mail);
+    $values['follow-author-mail-raw']    = $account->mail;
+    $values['follow-log-raw']            = isset($node->log) ? $node->log : '';
+    $values['follow-log']                = filter_xss($values['follow-log-raw']);
+    if (isset($node->created)) {
+      $values += token_get_date_token_values($node->created, 'follow-');
+    }
+    if (isset($node->changed)) {
+      $values += token_get_date_token_values($node->changed, 'follow-mod-');
+    }
+    $values['follow-node-teaser'] = !empty($node->teaser) ? check_markup($node->teaser, $node->format, FALSE) : '';
+    $values['follow-node-body'] = !empty($node->body) ? check_markup($node->body, $node->format, FALSE) : '';
+    $values['follow-node-teaser-raw'] = !empty($node->teaser) ? $node->teaser : '';
+    $values['follow-node-body-raw'] = !empty($node->body) ? $node->body : '';
+    // Fully rendered node content
+    // offered by notifications_content, but commented out here until we need it.
+    //$node = node_build_content($node);
+    //$values['node-content'] = drupal_render($node->content);
+
+    /* This SHOULD be doable by asking the token module for a list of
+     * node tokens, then prefixing each with "follow-". And for token_list, 
+     * this does work. But token_values doesn't allow any recursion.
+     * Leaving this code in case token module is ever updated to remove
+     * the recursion limitation.
+    $cur = token_get_values('node', $node, FALSE, $options);
+    foreach ($cur->tokens as $i => $token) {
+      $values['follow-' . $token] = $cur->values[$i];
+    }
+    // end code that should work, but token module breaks it */
+    return $values;
+  }
+}
+
+/**
+ * Implementation of hook_nodeapi()
+ *
+ * @todo Consider supporting multi-value nodereference fields
+ *       (currently only uses first value)
+ * @todo Consider responding to an update both if the field was 
+ *       previously empty or if it has changed.
+ * @todo Maybe only respond to update if "new revision" is checked.
+ *       Should probably be configurable?
+ */
+function notifications_node_follow_nodeapi(&$node, $op, $arg3, $arg4) {
+  global $user;
+  // notifications_content uses static storage to make sure it doesn't send notifications
+  // more than once if node_save() happens to be called multiple times on the same node.
+  // Using it here, too, since follow-ups could potentially have the same problem.
+  $done = &messaging_static(__FUNCTION__);
+  // Handle inserts and updates. Don't need to handle delete because notifications_content
+  // takes care of removing subscriptions on deleted nodes.
+  switch ($op) {
+    case 'update':
+      // For node updates, only look for a follow-up chain on nodereference fields that
+      // were previously empty, to keep from sending repetitive notifications.
+      $old_node = (array) node_load($node->nid);
+    case 'insert':
+      // Do nothing if this node has already been processed or if the "don't send
+      // notifications" box was checked.
+      if (isset($done[$node->nid]) || !empty($node->notifications_content_disable)) {
+        return;
+      }
+      $done[$node->nid] = TRUE;
+
+      $check_fields[$node->type] = variable_get('notifications_node_follow_type_' . $node->type, array());
+      $node_queue = array();
+
+      // Make sure the new node is a candidate for sending follow-up notifications.
+      // If it is, check for referenced nodes and start building a queue of them
+      // to fire follow-up events for.
+      if ($node->status 
+          && notifications_content_type_enabled($node->type) 
+          && $check_fields[$node->type]
+          ) {
+        $cur_node = (array) $node;
+        foreach ($check_fields[$node->type] as $field_name) {
+          // Check whether this nodereference field has a value. If this is an update,
+          // also check the old version and make sure the field was previously empty.
+          if (isset($cur_node[$field_name][0]['nid']) && ($op != 'update' || !isset($old_node[$field_name][0]['nid']))) {
+            $next_node = (array) node_load($cur_node[$field_name][0]['nid']);
+            if ($next_node) {
+              array_push($node_queue, $next_node);
+            }
+          }
+        }
+      }
+      // If immediate sending is active, reset the node cache so the old node isn't sent.
+      // This is copied from notifications_content with the assumption that it's also 
+      // needed here. Unfortunate side effect is that if any of the chained nodes have
+      // been previously loaded, they will be cleared from the cache.
+      //
+      // @TODO: Consider queuing the notifications events in the loop below, then
+      //        after the loop clear the node cache and call notifications_event
+      //        for each queued item.
+      if (variable_get('notifications_send_immediate', 0)) {
+        node_load(FALSE, NULL, TRUE);
+      }
+
+      // 
+      $visited = array();   // record nodes that have been visited, in case one is on the chain twice
+      while ($cur_node = array_shift($node_queue)) {
+        // Skip this node if it's been visited already, isn't published, or isn't enabled for notifications
+        if (isset($visited[$cur_node['nid']])
+            || !$cur_node['status']
+            || !notifications_content_type_enabled($cur_node['type'])
+            ) {
+          continue;
+        }
+        $visited[$cur_node['nid']] = TRUE;
+
+        $event = array(
+          'module' => 'node',
+          'oid' => $cur_node['nid'],
+          'type' => 'node',
+          'action' => 'followup',
+          //'node' => $node,
+          'params' => array('nid' => $cur_node['nid'], 'follow-nid' => $node->nid),      
+        );
+        notifications_event($event, array('node' => (object)$cur_node, 'follow-node' => $node));
+
+        // Load field list if this content type hasn't been seen before.
+        if (!isset($check_fields[$next_node['type']])) {
+          $check_fields[$cur_node['type']] = variable_get('notifications_node_follow_type_' . $cur_node['type'], array());
+        }
+        // If this node type is configured for follow-ups, check the enabled fields
+        // for references to other nodes that should also be checked.
+        if ($check_fields[$cur_node['type']]) {
+          foreach ($check_fields[$cur_node['type']] as $field_name) {
+            if (isset($cur_node[$field_name][0]['nid'])) {
+              $next_node = (array) node_load($cur_node[$field_name][0]['nid']);
+              if ($next_node) {
+                array_push($node_queue, $next_node);
+              }
+            }
+          }
+        }
+      }   // end while loop for $node_queue
+
+      break;
+  }
+}

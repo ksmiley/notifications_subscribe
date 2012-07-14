@@ -1,0 +1,1441 @@
+<?php
+// $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/notifications_subscribe.module#4 $
+/**
+ * @file
+ * Implements SMS follow by modifying Notifications and providing a new interface.
+ */
+
+/**
+ * Implementation of hook_notifications_event().
+ *
+ * Trims duplicate subscriptions from the event queue after they're added.
+ * A single event (such as adding a story) will generate a queue entry for
+ * each matching subscription that a user has. This method removes items from
+ * the queue so that each user only gets one notification per event per 
+ * send method.
+ */
+function notifications_subscribe_notifications_event($op, $event = NULL) {
+  if ($op == 'queued' && $event) {
+    // Grab all the queue entries related to this event, and sort them
+    // in a way that it'll be easy to remove duplicates. Subscription ID 
+    // is last so that, if there are duplicates, the oldest subscription
+    // will be used.
+    $result = db_query(
+      "SELECT * " . 
+      "FROM {notifications_queue} " . 
+      "WHERE eid = %d " . 
+      "ORDER BY mdid, send_method, send_interval, language, sid",
+      array($event->eid)
+    );
+    $remove = array();  // List of subscription queue IDs (sqid) to remove
+    $last = db_fetch_object($result);
+    while ($last && ($queue = db_fetch_object($result))) {
+      // If this entry and the previous one are going to the same destination,
+      // via the same send method, during the same time interval, and in 
+      // the same language, then delete this one.
+      if ($queue->mdid == $last->mdid 
+       && $queue->send_method == $last->send_method
+       && $queue->send_interval == $last->send_interval 
+       && $queue->language == $last->language
+      ) {
+        $remove[] = $queue->sqid;
+      } else {
+        // This wasn't a duplicate, so use it as the baseline for the next comparison.
+        $last = $queue;
+      }
+    }
+    // If duplicates were found, delete them.
+    if ($remove) {
+      $count = notifications_queue()->queue_delete(array('sqid' => $remove));
+    }
+  }
+}
+
+/**
+ * Implementation of hook_menu()
+ *
+ */
+function notifications_subscribe_menu() {
+  $items = array();
+  // AJAX-ified interface for subscribing to a node.
+  $items['node/%node/%ctools_js/follow'] = array(
+    'title' => 'Subscribe modal',
+    'page callback' => 'notifications_subscribe_node',
+    'page arguments' => array(1, 2),
+    'access callback' => TRUE,  // page callback will handle auth check
+    //'access callback' => 'notifications_subscribe_node_access',
+    //'access arguments' => array(1, 2),
+    'type' => MENU_CALLBACK,
+  );
+  // AJAX-ified interface for managing user subscriptions.
+  // This replaces the default screen, so it's added in hook_menu_alter()
+  /*$items['user/%user/notifications'] = array(
+    'type' => MENU_LOCAL_TASK,
+    'title' => 'Followed Topics',
+    'page callback' => 'notifications_subscribe_manage_page',
+    'page arguments' => array(1, 'manage'),
+    'access callback' => 'notifications_access_user',
+    'access arguments' => array(1),
+  );*/
+  // Direct link to enable/disable subscriptions
+  $items['user/%user/notifications/%ctools_js/subscriptions/enable/%notifications_subscription'] = array(
+    'type' => MENU_CALLBACK,
+    'title' => 'Enable subscription',
+    'page callback' => 'notifications_subscribe_manage_update',
+    'page arguments' => array('enable', 1, 6, 3),
+    'access callback' => 'notifications_subscription_access',
+    'access arguments' => array('edit', 6),
+  );
+  $items['user/%user/notifications/%ctools_js/subscriptions/disable/%notifications_subscription'] = array(
+    'type' => MENU_CALLBACK,
+    'title' => 'Disable subscription',
+    'page callback' => 'notifications_subscribe_manage_update',
+    'page arguments' => array('disable', 1, 6, 3),
+    'access callback' => 'notifications_subscription_access',
+    'access arguments' => array('edit', 6),
+  );
+  // Direct link to remove/add subscription
+  $items['user/%user/notifications/%ctools_js/subscriptions/remove/%notifications_subscription'] = array(
+    'type' => MENU_CALLBACK,
+    'title' => 'Remove subscription',
+    'page callback' => 'notifications_subscribe_manage_update',
+    'page arguments' => array('remove', 1, 6, 3),
+    'access callback' => 'notifications_subscription_access',
+    'access arguments' => array('edit', 6),
+  );
+  $items['user/%user/notifications/%ctools_js/subscriptions/restore'] = array(
+    'type' => MENU_CALLBACK,
+    'title' => 'Restore subscription',
+    'page callback' => 'notifications_subscribe_restore_subscription',
+    'page arguments' => array(1, 3),
+    'access callback' => 'notifications_access_subscribe',
+    'access arguments' => array(1),
+  );
+  return $items;
+}
+
+/**
+ * Implementation of hook_menu_alter()
+ *
+ * Simplifies the notifications edit interface for users by removing the 
+ * unhelpful overview screen, and by adjusting some tabs.
+ */
+function notifications_subscribe_menu_alter(&$items) {
+  // Remove default overview screen and manage screen. Replace with our custom
+  // subscription management screen.
+  $items['user/%user/notifications'] = array(
+    'type' => MENU_LOCAL_TASK,
+    'title' => 'Followed Topics',
+    'page callback' => 'notifications_subscribe_manage_page',
+    'page arguments' => array(1),
+    'access callback' => 'notifications_access_user',
+    'access arguments' => array(1),
+  );
+  unset($items['user/%user/notifications/subscriptions']);
+
+  // Remove the user pages provided by notifications. We provide a
+  // different interface for this that requires different menu entries.
+  unset($items['user/%user/notifications/overview']);
+  unset($items['user/%user/notifications/subscriptions']);
+  unset($items['user/%user/notifications/subscriptions/edit/%notifications_subscription']);
+  unset($items['user/%user/notifications/subscriptions/delete/%notifications_subscription']);
+  unset($items['user/%user/notifications/update/%']);
+}
+
+/**
+ * Display the follow/subscribe screen, either on its own or in a CTools modal.
+ *
+ * If the screen is showing in a CTools modal and the user isn't logged in,
+ * then this will first display the user login form before showing the
+ * subscribe form.
+ */
+function notifications_subscribe_node($node, $js = FALSE) {
+  // Check for unauthenticated users who clicked the button.
+  // Show them the login form first, then if their account has permission,
+  // move on to the subscription form.
+  $ajax_login = FALSE;
+  if ($js && user_is_anonymous()) {
+    // Either show the login form or process it. This method will only
+    // return if the login process has completed (otherwise CTools exits)
+    notifications_subscribe_show_login();
+    // Mark this login as having come from the modal. After the user
+    // saves the subscriptions, this flag will cause a page refresh
+    // so the other page elements reflect being logged in.
+    $ajax_login = TRUE;
+  }
+
+  // Make sure the user authenticated and has the correct permissions.
+  if (!user_access('manage own subscriptions')) {
+    return notifications_subscribe_not_authorized($js);
+  }
+
+  // Build the subscription form, and either stuff it into a modal
+  // or return it as part of a full page.
+  $title = t('Follow News: @title', array('@title' => $node->title));
+  $output = drupal_get_form('notifications_subscribe_node_options_form', $node, $ajax_login);
+  if ($js) {
+    $title = t('Follow News');  // use a shorter title for modal
+    ctools_include('ajax');
+    ctools_include('modal');
+    ctools_modal_render($title, $output);
+  } else {
+    drupal_set_title($title);
+    return $output;
+  }
+}
+
+/**
+ * Displays a slightly modified version of the login screen inside the follow modal.
+ * 
+ * @return Only returns if login completed. Otherwise, CTools exits.
+ */
+function notifications_subscribe_show_login() {
+  ctools_include('modal');
+  ctools_include('ajax');
+  $form_state = array(
+    'title' => t('Login'),
+    'ajax' => TRUE,
+  );
+  // Use an alias of user_login so our hook_form_alter() can add some information
+  // without affecting other login forms.
+  $output = ctools_modal_form_wrapper('notifications_subscribe_user_login', $form_state);
+  if (!empty($output)) {
+    ctools_ajax_render($output);  // Will send form to client and end request.
+  }
+  return FALSE;  // Only reached if the form was submitted without error.
+}
+
+function notifications_subscribe_not_authorized($js = FALSE) {
+  if ($js) {
+    ctools_include('ajax');
+    ctools_include('modal');
+    ctools_ajax_render(array(
+      ctools_modal_command_dismiss(),
+      ctools_ajax_command_remove('div.follow-button'),
+      ctools_ajax_command_error(t('Sorry, following is not available for this account.')),
+    ));
+  } else {
+    return MENU_ACCESS_DENIED;
+  }
+}
+
+/**
+ * Access callback for the node subscribe screen.
+ * 
+ * Allows anonymous access if it's an AJAX call so that the page callback has
+ * a chance to show the login screen. Otherwise it checks permission, and the
+ * default 403 handler will kick in to redirect to a login screen.
+ *
+ * @todo Probably can remove this function. The page callback is handling auth.
+ */
+function notifications_subscribe_node_access($node, $js = FALSE) {
+  // If a user isn't logged in and hits the AJAX version, let them
+  // through so the AJAX login form can pop up. Otherwise, check
+  // account permission.
+  if ($js && user_is_anonymous()) {
+    return TRUE;
+  } else {
+    return user_access('manage own subscriptions');
+  }
+}
+
+/**
+ * Cleans up and categorizes subscriptions that are available for a node.
+ */
+function notifications_subscribe_node_follows($node) {
+  notifications_include('object.inc');
+  $allowed_subs = notifications_object_user_subscriptions('node', $node);
+
+  // Calais vocabs are returned as name=>vid, but we need to look up an vid
+  // to find a name. This is used to separate the generic CalaisDocumentCategory
+  // terms from more specific ones.
+  $vocab_names = array_flip(calais_get_entity_vocabularies());
+  // As each vocabulary is encountered, we'll try to load more information about it
+  // from Calais (specifically, the relevance score). $vocabs will cache the result
+  // so each vocabulary is only loaded once per node.
+  $vocabs = array();
+  // Original taxonomy info is needed to change the subscription label.
+  $tax = $node->taxonomy;
+  // Separate taxonomy subs from all others, so they can be themed separately.
+  $subs = array();
+  // Some wording will change based on whether any of these terms are already subscribed.
+  $subs['#subscribed'] = 0;
+
+  // Sort the available subscriptions into different buckets, which will be displayed
+  // in different groups on the page.
+  while ($sub = array_pop($allowed_subs)) {
+    if ($sub->is_instance()) {
+      $subs['#subscribed']++;  // Count active subscriptions.
+    }
+    switch ($sub->type) {
+      case 'taxonomy':
+        // Look into the subscription to find the taxonomy id this refers to,
+        // then match it up with the node's taxonomy list.
+        $conds = $sub->get_conditions();
+        $term = $tax[$conds['tid']];
+        // Rename the subscription with just the term name. 
+        // e.g. "Drupal" instead of "Posts tagged with Drupal"
+        $sub->name = $term->name;
+        // Check whether this vocabulary has been seen before. If not, try 
+        // to load the Calais data for the vocab (to get access to relevancy 
+        // scores). For non-Calais vocabularies, put a null in the cache.
+        if (!isset($vocabs[$term->vid])) {
+          $keywords = calais_get_keywords($node->nid, $node->type, $term->vid, 0);
+          if (!empty($keywords[$term->vid])) {
+            foreach ($keywords[$term->vid] as $calais_term) {
+              $vocabs[$term->vid][$calais_term->tdid] = $calais_term;
+            }
+          } else {
+            $vocabs[$term->vid] = false;
+          }
+        }
+        // If this term is part of a Calais vocab, stuff the Calais data into
+        // the term object so it's accessible later during the sort.
+        if (is_array($vocabs[$term->vid]) && isset($vocabs[$term->vid][$term->tid])) {
+          $term->calais = $vocabs[$term->vid][$term->tid];
+          $term->calais->vocab_name = $vocab_names[$term->vid];
+        }
+        // Reduce duplicate terms to one of each. Some terms, such as names
+        // or generic categories, might appear more than once on this node
+        // because they can be in different vocabularies.
+        // 1. Terms the user is already subscribed to take precedence even
+        //    if there's a duplicate with a higher relevancy score.
+        // 2. Manual tags trump automatics. If the term is in a non-Calais vocab,
+        //    prefer that over an automatic tag.
+        // 3. Between duplicate Calais terms, use the one with the higher 
+        //    relevancy score.
+        if (isset($subs['taxonomy'][$term->name]) && is_array($subs['taxonomy'][$term->name])) {
+          $in_term = $subs['taxonomy'][$term->name]['term'];
+          // If the incumbent isn't an active subscription and the candidate is,
+          // use the subscription.
+          if (!$subs['taxonomy'][$term->name]['sub']->is_instance() && $sub->is_instance()) {
+            $subs['taxonomy'][$term->name] = array('term' => $term, 'sub' => $sub);
+          } else {
+            continue;   // skip the other checks
+          }
+          // If the incumbent is a Calais term and the candidate is a manual tag,
+          // prefer the manual tag.
+          if (isset($in_term->calais) && !isset($term->calais)) {
+            $subs['taxonomy'][$term->name] = array('term' => $term, 'sub' => $sub);
+          }
+          // If both are Calais terms, see if the candidate has a higher relevancy.
+          else if (isset($in_term->calais) && isset($term->calais)
+                   && $term->calais->relevance > $in_term->calais->relevance) {
+            $subs['taxonomy'][$term->name] = array('term' => $term, 'sub' => $sub);
+          }
+          // Else: Keep the incumbent.
+        } else {
+          // First occurence of this term, so no duplicate to remove yet.
+          $subs['taxonomy'][$term->name] = array('term' => $term, 'sub' => $sub);
+        }
+        break;
+      case 'follow':
+      case 'thread':
+        $sub->name = t('Follow updates to this article');
+        $subs['node'][] = $sub;
+        break;
+      default:
+        $subs['other'][] = $sub;
+        break;
+    }
+  }
+  if (isset($subs['taxonomy']) && is_array($subs['taxonomy']) && $subs['taxonomy']) {
+    // Sort the taxonomy subscriptions so that higher-ranked Calais terms are first,
+    // and so generic tags come after specific ones.
+    uasort($subs['taxonomy'], '_notifications_subscribe_cmp_subs');
+    // Strip the term from the subs list so the fieldset builder can understand it.
+    // Using array_map() for this would make a lot more sense if anonymous functions were available.
+    $subs['taxonomy'] = array_map('_notifications_subscribe_map_terms_callback', $subs['taxonomy']);
+  }
+
+  return $subs;
+}
+
+/**
+ * Custom sort callback used by the follow form.
+ *
+ * Attempts to provide better results by putting specific and relevant terms 
+ * near the top, and pushing generic category terms to the bottom.
+ */
+function _notifications_subscribe_cmp_subs($a, $b) {
+  // If both are Calais tags, sort by relevance score. If they have the same
+  // relevance score, natural sort the name.
+  // Exception: Push the generic document-categories to the end of the Calais list.
+  if (($a_c = $a['term']->calais) && ($b_c = $b['term']->calais)) {
+    if ($a_c->vocab_name == 'CalaisDocumentCategory' && $b_c->vocab_name == 'CalaisDocumentCategory') {
+      // Both are generic category terms. These usually have the same relevance, but check
+      // just in case. Fall back to natural sort of the name.
+      if ($a_c->relevance == $b_c->relevance) {
+        return strnatcmp($a_c->name, $b_c->name);   // alphabetical sort for same relevance
+      } else {
+        return ($a_c->relevance > $b_c->relevance) ? -1 : +1;  // higher relevance first
+      }
+    } else if ($a_c->vocab_name == 'CalaisDocumentCategory') {
+      return +1;  // $a is a generic category, so it should come after $b
+    } else if ($b_c->vocab_name == 'CalaisDocumentCategory') {
+      return -1;  // $b is a generic category, so it should come after $b
+    } else {
+      // Check whether these two non-category terms have the same relevance. If so, 
+      // fall back to natural sort of the name.
+      if ($a_c->relevance == $b_c->relevance) {
+        return strnatcmp($a_c->name, $b_c->name);   // alphabetical sort for same relevance
+      } else {
+        return ($a_c->relevance > $b_c->relevance) ? -1 : +1;  // higher relevance first
+      }
+    }
+  }
+  // Next two make all non-Calais terms appear after Calais tags
+  else if ($a['term']->calais && !$b['term']->calais) {
+    return -1;  // Calais $a should come before non-Calais $b
+  }
+  else if (!$a['term']->calais && $b['term']->calais) {
+    return +1;  // non-Calais $a should comes after Calais $b
+  }
+  // Otherwise, equal?
+  else {
+    return 0;  // punt
+  }
+}
+
+/**
+ * Helper function used with the follow form as a callback to array_map.
+ */
+function _notifications_subscribe_map_terms_callback($val) {
+  return $val['sub'];
+}
+
+/**
+ * Checks whether a node has followable topics and, if the current user
+ * isn't anonymous, whether the current user is subscribed to any.
+ *
+ * @param $node
+ *   The node object to check.
+ * @param $account
+ *   The user to check. Defaults to current user.
+ * @return
+ *   Object with two properties, both counters: 'available' and 'following'.
+ */
+function notifications_subscribe_node_follow_status($node) {
+  notifications_include('object.inc');
+  $counts = array(
+    'available' => 0,
+    'following' => 0,
+  );
+  if (user_is_anonymous()) {
+    $subs = _notifications_subscribe_node_status_anonymous($node);
+    $counts['available'] = count($subs);
+  } else {
+    $subs = notifications_object_user_subscriptions('node', $node);
+    $counts['available'] = count($subs);
+    foreach ($subs as $sub) {
+      if ($sub->is_instance()) {
+        $counts['following']++;
+      }
+    }
+  }
+  return (object) $counts;
+}
+
+/**
+ * Get available subscriptions for a node, without checking access and
+ * without creating subscription objects.
+ *
+ * Adapted from notifications_object_subscribe_options in object.inc.
+ */
+function _notifications_subscribe_node_status_anonymous($node) {
+  $node = notifications_object_load('node', $node);
+  $subscriptions = module_invoke_all('notifications_object_node', 'subscriptions', $node, NULL);
+  // Filter out subscription types that are disabled
+  foreach ($subscriptions as $key => $subs) {
+    $type = is_object($subs) ? $subs->type : $subs['type'];
+    if (!notifications_subscription_type_enabled($type)) {
+      unset($subscriptions[$key]);
+    }
+  }
+  return $subscriptions;
+}
+
+/**
+ * Form for node subscriptions.
+ *
+ * Heavily adapted from object.inc in the notifications framework.
+ * 
+ * @param $node
+ *   Node object for which subscription options should be shown.
+ * @param $refresh
+ *   (optional) Flag to force a page refresh if this is the AJAX form.
+ *
+ * @see theme_notifications_subscribe_node_options_form
+ */
+function notifications_subscribe_node_options_form($form_state, $node, $refresh = FALSE) {
+  global $user;
+  $subs = notifications_subscribe_node_follows($node);
+
+  // Build up the form. The heavy lifting is done by the notifications framework.
+  $form = array('#tree' => TRUE);
+  if (isset($subs['taxonomy']) && is_array($subs['taxonomy']) && count($subs['taxonomy'])) {
+    $form['follow-taxonomy'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Follow Topics'),
+      '#description' => t("Follow topics you're interested in, and future articles will be sent to your email."),
+    );
+    $form['follow-taxonomy'] = $form['follow-taxonomy'] + notifications_object_options_fieldset(array_values($subs['taxonomy']), FALSE);
+  }
+  if (isset($subs['node']) && is_array($subs['node']) && count($subs['node'])) {
+    $form['follow-node'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Follow Article'),
+      '#description' => t("Follow this article to get updates on it sent to your email."),
+    );
+    $form['follow-node'] = $form['follow-node'] + notifications_object_options_fieldset($subs['node'], FALSE);
+  }
+  if (isset($subs['other']) && is_array($subs['other']) && count($subs['other'])) {
+    $form['follow-other'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Other Options'),
+      '#description' => '',
+    );
+    $form['follow-other'] = $form['follow-other'] + notifications_object_options_fieldset($subs['other'], FALSE);
+  }
+
+  // Build a link to the edit user screen, in case the email address needs to be changed.
+  // The edit form should return to the current (follow) screen. drupal_get_destination()
+  // won't work because it might return the AJAX path, and the user probably won't know
+  // what to do with a JSON dump.
+  // @TODO: If the user is currently on the AJAX version, don't bounce them to non-AJAX
+  // after the edit screen. Instead, use a URL hashbang to return to the story page and
+  // immediately pop up the subscribe modal.
+  $address_link = l(
+    t('Change address'),
+    'user/'.$user->uid.'/edit',
+    array('query' => 
+      array('destination' => 'node/'.$node->nid.'/nojs/follow')
+    )
+  );
+  $form['address-confirm'] = array(
+    '#value' => t('Updates will be sent to <strong>@address</strong>. !edit', array('@address' => $user->mail, '!edit' => $address_link)),
+  );
+
+  $form['refresh-after-save'] = array(
+    '#type' => 'hidden',
+    '#default_value' => $refresh,
+  );
+
+  // Set submit button label differently if the user doesn't have any subscriptions on
+  // this node. In that case, the verb is "Follow". Otherwise, they could be adding
+  // or removing, so the verb is "Update"
+  if ($subs['#subscribed'] > 0) {
+    $form['submit'] = array('#type' => 'submit', '#value' => t('Update'));
+  } else {
+    $form['submit'] = array('#type' => 'submit', '#value' => t('Follow'));
+  }
+
+  // If full form, redirect so the full page which may have subscription links is updated
+  $form['#redirect'] = 'node/' . $node->nid;
+
+  return $form;
+}
+
+/**
+ * Process submission of subscription form.
+ *
+ * Adapted from object.inc in the notifications framework.
+ */
+function notifications_subscribe_node_options_form_submit($form, $form_state) {
+  // Note: the original form included checks for send_method and destination, which are mostly 
+  // used for anonymous users. These checks can be added back later if needed.
+
+  // The form splits the subscriptions into multiple groups. Assume any array of values that 
+  // starts with "follow-" is one of the groups. For each group, examine the list of subscriptions
+  // options to see if the user enabled or disabled any of them.
+  $enabled = $disabled = $total_active = 0;
+  foreach ($form_state['values'] as $key => $entry) {
+    if (substr($key, 0, 7) === 'follow-' && is_array($entry)) {
+      foreach ($entry['options'] as $index => $value) {
+        $subscription = $entry['params'][$index];
+        if ($value && !$subscription->is_instance()) {
+          // Checked a subscription that wasn't active before
+          notifications_save_subscription($subscription);
+          $enabled++;
+          $total_active++;
+        } elseif (!$value && $subscription->is_instance()) {
+          // Unchecked a subscription that was active before
+          notifications_subscription_delete($subscription->sid);
+          $disabled++;
+        } elseif ($subscription->is_instance()) {
+          $total_active++;
+        }
+      }
+    }
+  }
+
+  if ($_POST['js']) {
+    ctools_include('modal');
+    ctools_include('ajax');
+    $commands = array(
+      ctools_modal_command_dismiss(),
+    );
+    if (isset($form_state['values']['refresh-after-save']['#value']) && $form_state['values']['refresh-after-save']['#value']) {
+      $commands[] = ctools_ajax_command_reload();
+    } else {
+      $nid = arg(1);  // @TODO probably a better way to do this
+      $button = _theme_notifications_subscribe_link($nid, ($total_active > 0 ? TRUE : FALSE));
+      $commands[] = ctools_ajax_command_html('div.follow-button', $button);
+    }
+    ctools_ajax_render($commands);
+  } else {
+    drupal_set_message(t('Follow subscriptions have been updated.'));
+  }
+}
+
+/**
+ * Implementation of hook_forms()
+ */
+function notifications_subscribe_forms() {
+  return array(
+    'notifications_subscribe_user_login' => array(
+      'callback' => 'user_login',
+    ),
+  );
+}
+
+/**
+ * Manage user subscriptions.
+ *
+ * Heavily modified from notifications.manage.inc to create a simpler,
+ * AJAX-ified interface for users to manage their subscriptions.
+ * 
+ * Some key differences from the original:
+ * - Only handles user-facing screens. (Original still handles admin.)
+ * - Currently ignores send method and send interval, because we aren't 
+ *   yet offering options for those.
+ * - All state change is through links. This will likely change if the features
+ *   are expanded (e.g. offering digesting or SMS delivery), so it might have
+ *   to switch back to using FAPI.
+ * - Operations like enabling/disabling and deleting are handled via AJAX.
+ * - No filter options.
+ * - No bulk operations.
+ *
+ * @param $account
+ *   User account or destination
+ */
+function notifications_subscribe_manage_page($account) {
+  ctools_include('ajax');  
+
+  // If this screen is being shown because of a redirect from a subscription
+  // operation (such as enabling/disabling or removing), manage_subscribe_manage_update()
+  // will save the changed row in the session.
+  $changed_row = array();
+  if (isset($_SESSION['manage_subscribe_changed_row']) && is_array($_SESSION['manage_subscribe_changed_row'])) {
+    $changed_row = $_SESSION['manage_subscribe_changed_row'];
+    unset($_SESSION['manage_subscribe_changed_row']);
+  }
+
+  $result = db_query(
+    'SELECT n.*, d.address ' . 
+    'FROM {notifications} n ' . 
+      'INNER JOIN {messaging_destination} d ' . 
+      'ON n.mdid = d.mdid ' . 
+    'WHERE n.uid = %d ' .
+    'AND n.status <> %d ' . 
+    'ORDER BY n.type ASC, n.sid DESC',
+    array($account->uid, Notifications_Subscription::STATUS_DISABLED)
+  );
+  $header = array(
+    array(
+      'data' => t('Type'),
+      'class' => 'sub-type',
+    ),
+    array(
+      'data' => t('Name'),
+      'class' => 'sub-name',
+    ),
+    array(
+      'data' => t('Actions'),
+      'class' => 'sub-actions',
+      'colspan' => 2,
+    ),
+  );
+  $rows = array();
+  // If a subscription was removed right before this screen was shown, put the
+  // row at the top, since it won't show up in the DB query.
+  if ($changed_row && isset($changed_row['type']) && $changed_row['type'] == 'removed') {
+    $rows[] = $changed_row['row'];
+  }
+  // Loop through user subscriptions and build a table of them.
+  while ($object = db_fetch_object($result)) {
+    $sub = notifications_load_subscription($object);
+    // If this row was changed by a previous operation, use the row from
+    // the session. Otherwise, render it as a normal row.
+    if ($changed_row && isset($changed_row['sid']) && $changed_row['sid'] == $sub->sid) {
+      $rows[] = $changed_row['row'];
+    } else {
+      $rows[] = notifications_subscribe_manage_normal_row($account, $sub);
+    }
+  }
+  uasort($rows, '_notifications_subscribe_cmp_rows');
+  if (count($rows)) {
+    ctools_add_js('ajax-responder');   // load the code to enable AJAX links
+    ctools_add_js('ajax-commands', 'notifications_subscribe');   // our custom AJAX commands
+    ctools_add_css('manage-subs', 'notifications_subscribe');  // style the table
+    return theme('table', $header, $rows, array('id' => 'manage-subscriptions'));
+  } else {
+    // @TODO: Make this message far more useful. Users might find this tab right
+    // after they sign up, so it should explain what the featue is and how to 
+    // start following topics and articles. 
+    // *** Should show a list of common or popular topics to follow
+    return '<p>' . t('You are not following any topics.') . '</p>';
+  }
+}
+
+function _notifications_subscribe_cmp_rows($a, $b) {
+  // Removed rows go first
+  if (strpos($a['class'], 'sub-removed') !== FALSE) {
+    return -1;
+  } elseif (strpos($b['class'], 'sub-removed') !== FALSE) {
+    return 1;
+  }
+  // Group rows by subscription type
+  // This is a cheat to get "Topics" before "Articles". If more types are
+  // added, this will probably need to be switched to a normal alphabetical
+  // sort, or expanded to use an explicit sort order.
+  $cmp_type = strnatcasecmp($b['data'][0]['data'], $a['data'][0]['data']);
+  if ($cmp_type !== 0) {
+    return $cmp_type;
+  }
+  // If the two rows have the same subscription type, compare names.
+  return strnatcasecmp($a['data'][1]['data'], $b['data'][1]['data']);
+}
+
+/**
+ * Perform an operation on a subscription.
+ *
+ * Sends an updated table row back to the client for AJAX requests.
+ * Otherwise, redirects to the manage page and uses session storage
+ * to show the updated row.
+ *
+ * @param $op
+ *   One of: enable, disable, remove, restore
+ * @param $account
+ *   User associated with the subscription
+ * @param $sub
+ *   Notifications subscription object to perform the operation on.
+ * @param $js
+ *   Flag indicating this is a CTools AJAX call.
+ *
+ * @return Array representing a table row.
+ */
+function notifications_subscribe_manage_update($op, $account, $sub, $js = FALSE) {
+  ctools_include('ajax');
+  // Check that this was called with a valid link. Will exit if check fails.
+  notifications_subscribe_check_signature($account, $js);
+  switch ($op) {
+    case 'enable':
+      $sub->status = Notifications_Subscription::STATUS_ACTIVE;
+      $sub->save();
+      $type = 'changed';
+      $row = notifications_subscribe_manage_changed_row($account, $sub, $js);
+      break;
+    case 'disable':
+      $sub->status = Notifications_Subscription::STATUS_INACTIVE;
+      $sub->save();
+      $type = 'changed';
+      $row = notifications_subscribe_manage_changed_row($account, $sub, $js);
+      break;
+    case 'remove':
+      // Create the row before deleting so the data is still available.
+      $type = 'removed';
+      $row = notifications_subscribe_manage_removed_row($account, $sub, $js);
+      notifications_subscription_delete($sub->sid);
+      break;
+    case 'restore':
+      // The actual restore logic has already happened, but the row
+      // should be marked as changed. 
+      $type = 'changed';
+      $row = notifications_subscribe_manage_changed_row($account, $sub, $js);
+      break;
+    default:
+      // Shouldn't ever happen, but just in case.
+      $row = notifications_subscribe_manage_normal_row($account, $sub, $js);
+  }
+  // For AJAX requests, send back the modified row. Otherwise, stash
+  // the row in the session and redirect to the manage page, which will
+  // pull the row from the session and display it.
+  if ($row && $js) {
+    // Render the single updated row as HTML.
+    $html = notifications_subscribe_render_tablerow($row);
+    // Send the updated row back to the client. Make the updated row stand out
+    // by clearing the "changed" class on other rows, and removing rows for
+    // deleted subscriptions. The exception is for a "restore" operation, where
+    // the removed row should be replaced with the restored one.
+    $commands = array();
+    $commands[] = notifications_subscribe_ajax_command_remove_class('#manage-subscriptions tr.changed', 'changed');
+    if ($op == 'restore') {
+      $selector = '#manage-subscriptions tr.sub-removed';
+    } else {
+      $commands[] = ctools_ajax_command_remove('#manage-subscriptions tr.sub-removed');
+      $selector = '#subscription-' . $sub->sid;
+    }
+    $commands[] = ctools_ajax_command_replace($selector, $html);
+    $commands[] = ctools_ajax_command_restripe('#manage-subscriptions');
+    ctools_ajax_render($commands);   // will call exit
+  } else {
+    $_SESSION['manage_subscribe_changed_row'] = array(
+      'sid'  => $sub->sid,
+      'type' => $type,
+      'row'  => $row,
+    );
+    unset($_REQUEST['destination']);
+    drupal_goto('user/'.$account->uid.'/notifications');
+  }
+}
+
+/**
+ * Restore a deleted subscription by resubscribing to it.
+ *
+ * Modified from notifications_page_subscribe (in notifications.pages.inc)
+ * to support AJAX operation. After recreating the subscription, hands off
+ * to notifications_subscribe_manage_update to render the change.
+ *
+ * @todo Add signature checking
+ */
+function notifications_subscribe_restore_subscription($account, $js, $type, $fields, $values) {
+  // Check that this was called with a valid link. Will exit if check fails.
+  notifications_subscribe_check_signature($account, $js); 
+  // Build subscriptions object
+  $subscription = notifications_build_subscription(array(
+    'uid' => $account->uid,
+    'type' => $type,
+    //'send_interval' => $send_interval,  // not currently using
+    //'send_method' => $send_method,      // not currently using
+  ));
+  $subscription->add_field_args($fields, $values);
+  $subscription->set_account($account);
+
+  // Make sure this subscription can be created, then save it.
+  if ($account->uid && notifications_user_allowed_subscription($account, $subscription)) {
+    // Subscribe, no confirmation
+    notifications_save_subscription($subscription);
+    // Let the main update handler decide whether to redraw the page or send the
+    // modified row back over AJAX.
+    return notifications_subscribe_manage_update('restore', $account, $subscription, $js);
+  } else {
+    // Something's not right. Send user to the manage page without making changes.
+    if ($js) {
+      ctools_include('ajax');
+      $commands = array(ctools_ajax_command_redirect('user/'.$account->uid.'/notifications'));
+      ctools_ajax_render($commands);
+    } else {
+      unset($_REQUEST['destination']);
+      drupal_goto('user/'.$account->uid.'/notifications');
+    }
+  }
+}
+
+/**
+ * Verifies that signed AJAX links are valid for the current operation.
+ *
+ * @param $js
+ *   Set to true for AJAX requests.
+ * @return 
+ *   Does not return if verification fails. Depending on the request type,
+ *   will send back an AJAX error message or will redirect to manage screen.
+ *   Returns TRUE if verification passes.
+ */
+function notifications_subscribe_check_signature($account, $js = FALSE) {
+  // Some operations, such as "restore", might end up calling this method twice.
+  // Cache the result per request to prevent unnecessary checks.
+  static $signed;
+  if (!$signed) {
+    $path = arg();
+    array_splice($path, 3, 1);   // remove the AJAX flag, since it might have changed
+    $signed = $_GET['signature'] && notifications_check_signature($path, $_GET);
+  }
+  if ($signed) {
+    return TRUE;
+  } else {
+    if ($js) {
+      ctools_ajax_render(array(
+        ctools_ajax_command_error(t('Link is no longer valid. Reload the page and try again.')),
+      ));
+    } else {
+      // Send user to manage screen. Might end up at 403 page if they aren't logged in.
+      // Message already set by notifications_check_signature().
+      unset($_REQUEST['destination']);
+      drupal_goto('user/' . $account->uid . '/notifications');
+    }
+  }
+}
+
+/**
+ * Returns the HTML for a single table row, for use with AJAX responses.
+ *
+ * Modified from core's theme_table, which only renders full tables.
+ * The logic for odd/even striping is omitted because this is meant for
+ * use with AJAX, and CTools provides a client-side "restripe" command.
+ *
+ * @param $row
+ *   Array representing a table row.
+ *
+ * @return Rendered HTML
+ *
+ * @see theme_table
+ */
+function notifications_subscribe_render_tablerow($row) {
+  $output = "";
+  $attributes = array();
+  // Check if we're dealing with a simple or complex row
+  if (isset($row['data'])) {
+    foreach ($row as $key => $value) {
+      if ($key == 'data') {
+        $cells = $value;
+      }
+      else {
+        $attributes[$key] = $value;
+      }
+    }
+  }
+  else {
+    $cells = $row;
+  }
+  if (count($cells)) {
+    // Build row
+    $output .= ' <tr' . drupal_attributes($attributes) . '>';
+    $i = 0;
+    foreach ($cells as $cell) {
+      $output .= _theme_table_cell($cell);
+    }
+    $output .= " </tr>\n";
+  }
+  return $output;
+}
+
+
+/**
+ * Generate a table row representing an existing subscription.
+ *
+ * Includes links to delete the subscription and to enable or disable it.
+ */
+function notifications_subscribe_manage_normal_row($account, $sub, $js = FALSE) {
+  $format_mode = Notifications_Subscription::FORMAT_PLAIN | Notifications_Subscription::FORMAT_INLINE;
+  $data = array();
+  $data[] = array(
+    'data' => notifications_subscribe_translate_type($sub->get_type('title')),
+    'class' => 'sub-type',
+  );
+  $data[] = array(
+    'data' => notifications_subscribe_translate_name($sub->format_name($format_mode)),
+    'class' => 'sub-name',
+  );
+  if ($sub->status == Notifications_Subscription::STATUS_ACTIVE) {
+    $class = "sub-active";
+    $data[] = array(
+      'data' => notifications_subscribe_signed_ajax_link(
+        t('Disable'),
+        'user/' . $account->uid . '/notifications/nojs/subscriptions/disable/' . $sub->sid,
+        t('Temporarily turn off this alert')
+      ),
+      'class' => 'sub-actions sub-action-disable',
+    );
+  } else {
+    $class = "sub-inactive";
+    $data[] = array(
+      'data' => notifications_subscribe_signed_ajax_link(
+        t('Enable'),
+        'user/' . $account->uid . '/notifications/nojs/subscriptions/enable/' . $sub->sid,
+        t('Turn this alert back on')
+      ),
+      'class' => 'sub-actions sub-action-enable',
+    );
+  }
+  $data[] = array(
+    'data' => notifications_subscribe_signed_ajax_link(
+      t('Remove'),
+      'user/' . $account->uid . '/notifications/nojs/subscriptions/remove/' . $sub->sid,
+      t('Stop receiving this alert')
+    ),
+    'class' => 'sub-actions sub-action-remove',
+  );
+  return array(
+    'id' => 'subscription-' . $sub->sid,
+    'data' => $data,
+    'class' => $class,
+  );
+}
+
+/**
+ * Generate a table row representing a subscription that was just changed.
+ * 
+ * The row will be the same as a normal one, but with an additional "changed" class.
+ */
+function notifications_subscribe_manage_changed_row($account, $sub, $js = FALSE) {
+  $row = notifications_subscribe_manage_normal_row($account, $sub, $js);
+  $row['class'] = isset($row['class']) ? $row['class'] . ' changed' : 'changed';
+  return $row;
+}
+
+/**
+ * Generate a table row for a subscription that was just deleted.
+ *
+ * Includes a confirmation message and link to restore the subscription.
+ */
+function notifications_subscribe_manage_removed_row($account, $sub, $js = FALSE) {
+  $format_mode = Notifications_Subscription::FORMAT_PLAIN | Notifications_Subscription::FORMAT_INLINE;
+  $fields = $sub->get_conditions();
+  $undo_path = implode('/', array(
+    'user',
+    $account->uid,
+    'notifications',
+    'nojs',
+    'subscriptions',
+    'restore',
+    $sub->type,
+    implode(',', array_keys($fields)),
+    implode(',', $fields),
+  ));
+  $type = notifications_subscribe_translate_type($sub->get_type('title'));
+  $name = notifications_subscribe_translate_name($sub->format_name($format_mode));
+  $data = array();
+  $data[] = array(
+    'data' => t('!type alert for "!name" has been removed.', array('!type' => $type, '!name' => $name)),
+    'class' => 'sub-message',
+    'colspan' => 2,
+  );
+  $data[] = array(
+    'data' => notifications_subscribe_signed_ajax_link(
+      t('Restore'),
+      $undo_path,
+      t('Keep receiving this alert')
+    ),
+    'class' => 'sub-actions sub-action-restore',
+    'colspan' => 2,
+  );
+  return array(
+    'id' => 'subscription-' . $sub->sid,
+    'data' => $data,
+    'class' => 'changed sub-removed'
+  );
+}
+
+/**
+  * Create an AJAX command to remove a class or classes from all matched elements.
+  *
+  * @param $selector
+  *   The CSS selector. This can be any selector jQuery uses in $().
+  * @param $classes
+  *   The class to remove from matched elements. An array or space-separated list will remove multiple classes.
+  */
+function notifications_subscribe_ajax_command_remove_class($selector, $classes) {
+  return array(
+    'command' => 'removeClass',
+    'selector' => $selector,
+    'classes' => is_array($classes) ? implode(' ', $classes) : $classes,
+  );
+}
+
+/**
+  * Create an AJAX command to add a class or classes to all matched elements.
+  *
+  * @param $selector
+  *   The CSS selector. This can be any selector jQuery uses in $().
+  * @param $classes
+  *   The class to add to matched elements. An array or space-separated list will remove multiple classes.
+  */
+function notifications_subscribe_ajax_command_add_class($selector, $classes) {
+  return array(
+    'command' => 'addClass',
+    'selector' => $selector,
+    'classes' => is_array($classes) ? implode(' ', $classes) : $classes,
+  );
+}
+
+/**
+ * Renders text as a signed, AJAX-enabled link.
+ *
+ * Creates an HTML link, so text should be prescreened. Adds a class
+ * so CTools will process the link, and adds query arguments that can
+ * be used to verify the link.
+ *
+ * This method replaces ctools_ajax_text_button(), but note the 
+ * parameters are slightly different.
+ *
+ * @param $text
+ *   Text to make into a string
+ * @param $dest
+ *   Path to link to. Will also be used to generate signature.
+ * @param $alt
+ *   Shortcut for setting $options['attributes']['title']
+ * @param $options
+ *   Array of attributes to pass to l(). The class and query keys will be added or modified.
+ *
+ * @see ctools_ajax_text_button
+ */
+function notifications_subscribe_signed_ajax_link($text, $dest, $alt = "", $options = array()) {
+  if (isset($options['attributes']) && !is_array($options['attributes'])) {
+    $options['attributes'] = array();
+  }
+  if (!isset($options['html'])) {
+    $options['html'] = TRUE;
+  }
+  // Add the class that makes CTools process this link.
+  $options['attributes']['class'] = isset($options['attributes']['class']) ? 'ctools-use-ajax ' . $options['attributes']['class'] : 'ctools-use-ajax';  
+  if ($alt) {
+    $options['attributes']['title'] = $alt;
+  }
+  // Have to use a private function to sign the link. Parse out any existing
+  // query parameters because they will be included in the signature check.
+  $query = array();
+  if (isset($options['query'])) {
+    if (is_array($options['query'])) {
+      $query = $options['query'];
+    } elseif (is_string($options['query'])) {
+      parse_str($options['query'], $query);
+    }
+  }
+  // Add timestamp and signature to query
+  $query['timestamp'] = time();
+  $path_parts = explode('/', $dest);
+  array_splice($path_parts, 3, 1);   // Remove the AJAX flag, since CTools will change it.
+  $query['signature'] = _notifications_signature($path_parts, $query);
+  // Put modified query into link options
+  $options['query'] = $query;
+  return l($text, $dest, $options);
+}
+
+/**
+ * Implementation of hook_form_alter()
+ *
+ * Removes unwanted information from the user profile form and from
+ * the user subscriptions screen. Also adds some descriptive text
+ * to the user login form that appears in the follow modal.
+ */
+function notifications_subscribe_form_alter(&$form, $form_state, $form_id) {
+  switch ($form_id) {
+    case 'user_profile_form':
+      // Wipe out the options that messaging and notifications add to
+      // the user form (e.g. default send interval, default send method).
+      // As configured, there aren't enough options for these to be
+      // useful. If they're needed later, we'll need to find a better
+      // way to present this option.
+      unset($form['messaging']);
+      break;
+    /* This form doesn't need to be altered anymore because it's been reimplemented,
+     * and the menu_alter basically disables the old form. */
+    /*case 'notifications_manage_user_subscriptions':
+      // Remove the "filter" fieldset.
+      unset($form['filters']);
+      unset($form['#theme']);
+      // Remove two of the columns of data from the subscription tab under
+      // the user screen. The default theme function will hide the columns
+      // if the data isn't present.
+      unset($form['admin']['send_method']);
+      unset($form['admin']['send_interval']);
+      // Modify the types and descriptions in the table to use American English
+      // instead of Drupal English. This is probably a hack.
+      foreach ($form['admin']['type'] as $sub_id => $type) {
+        // Change values in the "type" column to match language we use elsewhere.
+        $form['admin']['type'][$sub_id]['#value'] = notifications_subscribe_translate_type($type['#value']);
+        switch ($type['#value']) {
+          case t('Thread'):
+          case t('Follow-ups'):
+            $form['admin']['type'][$sub_id]['#value'] = t('Article');
+            break;
+          case t('Tags'):
+            $form['admin']['type'][$sub_id]['#value'] = t('Topic');
+            break;
+        }
+        $form['admin']['description'][$sub_id]['#value'] = notifications_subscribe_translate_name($form['admin']['description'][$sub_id]['#value']);
+      }
+      break;*/
+    case 'notifications_subscribe_user_login':
+      $login_options = array(
+        t("Haven't registered yet? !register", array('!register' => l(t('Create an account.'), 'user/register'))),
+        t("Can't access your account? !reset", array('!reset' => l(t('Request a new password.'), 'user/password'))),
+      );
+      $prepend['follow-login-explain'] = array(
+        '#prefix' => '<div class="follow-login-explain">',
+        '#value' => t('Follow this article and the topics in it to get future updates sent to your email. To get started, please log in to your account.'),
+        '#suffix' => '</div>',
+      );
+      $prepend['follow-login-register'] = array(
+        '#prefix' => '<div class="follow-login-options">',
+        '#value' => theme('item_list', $login_options),
+        '#suffix' => '</div>',
+      );
+      $form = $prepend + $form;
+      $form['submit']['#prefix'] = '<div class="follow-login-controls">';
+      $form['submit']['#suffix'] = '</div>';
+      break;
+    case 'notifications_form_unsubscribe_confirm':
+      if (isset($form['info'])) {
+        $sub = $form['subscription']['#value'];
+        $type = notifications_subscribe_translate_type($sub->get_type('title'));
+        $name = notifications_subscribe_translate_name($sub->get_name());
+        drupal_set_title(t('Confirm change to alert'));
+        $form['info']['#title'] = t('Following !type', array('!type' => $type));
+        $form['info']['#value'] = $name;
+        unset($form['info']['#description']);
+        $form['description']['#value'] = t('Are you sure you want to stop following this !type?', array('!type' => $type));
+        // Change the button text from "Unsubscribe" to something more specific.
+        // However, the submit handler relies on the text saying "Unsubscribe",
+        // so this has to be done in an #after_build handler.
+        if (!isset($form['#after_build'])) {
+          $form['#after_build'] = array();
+        }
+        $form['#after_build'][] = '_notifications_subscribe_form_unsubscribe_after_build';
+      }
+      break;
+  }
+}
+
+function _notifications_subscribe_form_unsubscribe_after_build($form, &$form_state) {
+  $form['actions']['submit']['#value'] = t('Stop Following');
+  return $form;
+}
+
+function notifications_subscribe_translate_type($type) {
+  switch ($type) {
+    case t('Thread'):
+    case t('Follow-ups'):
+      return t('Article');
+      break;
+    case t('Tags'):
+      return t('Topic');
+      break;
+    default:
+      return $type;
+  }
+}
+
+function notifications_subscribe_translate_name($name) {
+  // Strip the object-type from the description, so it displayed "Headline"
+  // instead of "Node: Headline".
+  $parts = explode(':', $name, 2);
+  return trim($parts[1]);
+}
+
+
+
+/**
+ * Implementation of hook_token_list().
+ */
+function notifications_subscribe_token_list($type = 'all') {
+  $tokens = array();
+  if ($type == 'subscription' || $type == 'all') {
+    $tokens['subscription']['followed-type'] = t('The type of subscription being followed (e.g. "Article", "Topic").');
+    $tokens['subscription']['followed-name'] = t('The article or topic being followed.');
+  }
+  return $tokens;
+}
+
+/**
+ * Implementation of hook_token_values()
+ */
+function notifications_subscribe_token_values($type, $object = NULL, $options = array()) {
+  $language = isset($options['language']) ? $options['language'] : $GLOBALS['language'];
+  switch ($type) {
+    case 'subscription':
+      $values = array();
+      // Tokens only for registered users
+      if ($sub = messaging_check_object($object, 'Notifications_Subscription')) {
+        $format_mode = Notifications_Subscription::FORMAT_PLAIN | Notifications_Subscription::FORMAT_INLINE;
+        $values['followed-type'] = notifications_subscribe_translate_type($sub->get_type('title'));
+        $values['followed-name'] = notifications_subscribe_translate_name($sub->format_name($format_mode));
+      }
+      return $values;
+      break;
+  }
+}
+
+/**
+ * Implementation of hook_block()
+ * 
+ * Adds a block that simply shows the "follow" button. This can probably be
+ * removed, since it was just added for convenience during testing.
+ */
+function notifications_subscribe_block($op = 'list', $delta = 0) {
+  if ($op == 'list') {
+    $blocks[0]['info'] = t('Follow');
+    $blocks[0]['cache'] = BLOCK_NO_CACHE;
+    return $blocks;
+  }
+  else if ($op == 'view') {
+    // Only return block if we have something for it
+    if (arg(0) == 'node' && is_numeric(arg(1)) && ($node = node_load(arg(1)))) {
+      $block['subject'] = t('Follow');
+      $block['content'] = theme('notifications_subscribe_link', $node);
+      return $block;  
+    }
+  }  
+}
+
+/**
+ * Implementation of hook_nodeapi()
+ *
+ * Adds JS and CSS files to the page when an editorial node is about
+ * to be displayed 
+ */
+function notifications_subscribe_nodeapi($node, $op, $a3, $a4) {
+  if ($op == 'view') {
+    // For view, $a3=true if only the teaser is being shown,
+    // and $a4=true if node is being shown on its own page.
+    if ($a4 && $node->type == 'editorial' && (user_is_anonymous() || user_access('manage own subscriptions'))) {
+      notifications_subscribe_add_styles();
+    }
+  }
+}
+
+
+/**
+ * Implementation of hook_theme()
+ */
+function notifications_subscribe_theme() {
+  return array(
+    'notifications_subscribe_link' => array(
+      'arguments' => array('node' => NULL),
+    ),
+    'notifications_subscribe_node_options_form' => array(
+      'arguments' => array('form' => NULL),
+    ),
+  );
+}
+
+/**
+ * Add CSS and JS files needed for following to the current page.
+ *
+ * This will only add the files once per request, even if it's called
+ * multiple times.
+ */
+function notifications_subscribe_add_styles() {
+  static $added = false;
+  if (!$added) {
+    ctools_include('ajax');
+    ctools_include('modal');
+    ctools_modal_add_js();
+    ctools_add_js('ajax-commands', 'notifications_subscribe');   // our custom AJAX commands
+    ctools_add_css('subscribe_modal', 'notifications_subscribe');
+    // HACK FOR CTOOLS 1.7 which doesn't support styling the modal. This JS file has a backport of
+    // a CTools 1.8 function that's been slightly hacked to handle the follow modal. Adding as 'theme'
+    // instead of 'module' so that'll be loaded after the original modal.js
+    // @TODO remove when we upgrade to CTools 1.8
+    drupal_add_js(drupal_get_path('module', 'notifications_subscribe') . '/js/modal-override.js', 'theme');
+
+    // Add settings to configure modal popup.
+    $modal_style = array(
+      'follow-style' => array(
+        'modalSize' => array(
+          'type' => 'fixed',
+          'width' => 600,
+          'height' => 550,
+          /*'type' => 'scale', // Commented out because keeping one axis
+          'width' => 600,      // fixed and letting the other scale currently
+          'height' => .85,     // requires a CTools patch.
+          'autoHeight' => 1,*/
+          'addWidth' => 3,  // enlarge modal slightly to make room for border
+          'contentBottom' => 40,
+        ),
+        'modalOptions' => array(
+          'opacity' => .3,
+          'background-color' => '#000',
+        ),
+        'animation' => 'slideDown',
+        'closeText' => t('Close'),
+        'closeImage' => '',
+      ),
+    );
+    drupal_add_js($modal_style, 'setting');
+    $added = true;
+  }
+}
+
+/**
+ * Sets up the page for an AJAX-ified follow screen, and returns code 
+ * for the button to open the screen.
+ *
+ * @param $node
+ *   The node to create the follow link for.
+ */
+function theme_notifications_subscribe_link($node) {
+  // Don't show the follow button on the follow screen.
+  if (arg(0) == 'node' && arg(3) == 'follow') {
+    return "";
+  }
+  $status = notifications_subscribe_node_follow_status($node);
+  if ((user_is_anonymous() || user_access('manage own subscriptions')) && $status->available > 0) {
+    notifications_subscribe_add_styles();  // add CSS and JS files, if not done already
+    $button = _theme_notifications_subscribe_link($node->nid, ($status->following > 0 ? TRUE : FALSE));
+    return '<div class="follow-button">' . $button . '</div>';
+  } else {
+    return "";
+  }
+}
+
+function _theme_notifications_subscribe_link($nid, $following) {
+   $label = array(
+    '<span class="follow-label">',
+    ($following ? t('Following') : t('Follow This Article')),
+    '</span>',
+    '<div class="follow-icon"></div>',
+  );
+  $follow_class = $following ? 'following' : 'not-following';
+  return ctools_modal_text_button(
+    implode('', $label),
+    'node/' . $nid . '/nojs/follow',
+    t('Get future updates about this article and related topics sent to your email.'),
+    'ctools-modal-follow-style ' . $follow_class
+  );
+}
+
+/**
+ * Custome theme implementation for the subscribe form.
+ *
+ * Adds some descriptive text, avoids using fieldsets, and loads CSS 
+ * to put everything in the right place.
+ */
+function theme_notifications_subscribe_node_options_form($form) {
+  global $user;
+  drupal_add_css(drupal_get_path('module', 'notifications_subscribe') . '/css/subscribe_form.css', 'module');
+
+  $output = array();
+  if (isset($form['follow-taxonomy']) && is_array($form['follow-taxonomy'])) {
+    $output = array_merge($output, array(
+      '<div class="follow-taxonomy">',
+        '<p>',
+          t("Below are some of the people, companies, places and topics mentioned in this article. Follow topics you're interested in, and future articles will be sent to your email."),
+        '</p>',
+        drupal_render($form['follow-taxonomy']['options']),
+      '</div>',
+    ));
+    unset($form['follow-taxonomy']);
+  }
+  if (isset($form['follow-node']) && is_array($form['follow-node'])) {
+    $output = array_merge($output, array(
+      '<div class="follow-node">',
+        drupal_render($form['follow-node']['options']),
+        '<p>',
+          t("Articles are sometimes updated throughout the day as new information becomes available. Follow this article to get updates sent to your email."),
+        '</p>',
+      '</div>',
+    ));
+    unset($form['follow-node']);
+  }
+
+  // Only add controls if there are subscriptions to show. Otherwise, display
+  // a message and a link back to the node.
+  if ($output) {
+    $output = array_merge($output, array(
+      '<div class="follow-controls">',
+        drupal_render($form['submit']),
+      '</div>',
+      '<div class="follow-subscribe-address">',
+        drupal_render($form['address-confirm']),
+      '</div>',
+    ));
+    $output[] = drupal_render($form);
+  } else {
+    $output[] = '<p>' . t('This article does not have any topics available to follow.') . '</p>';
+    $output[] = l(t('Return to article'), $form['#redirect']);
+  }
+
+  return implode("\n", $output);
+}

@@ -1,0 +1,6 @@
+; $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/notifications_revision/notifications_revision.info#1 $
+name = Node Revision event
+description = Adds an event that triggers when a node is updated and marked as a new revision.
+package = "Notifications"
+dependencies[] = notifications_content
+core = 6.x

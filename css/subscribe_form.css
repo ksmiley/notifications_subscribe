@@ -1,0 +1,76 @@
+/* $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/css/subscribe_form.css#1 $ */
+/**
+ * @file
+ * Styles for the follow subscription form.
+ */
+
+#notifications-subscribe-node-options-form .form-item {
+  display: block;
+  margin: 0 5px;
+  padding: 7px;
+}
+
+#notifications-subscribe-node-options-form .follow-taxonomy {
+  margin: 0 0 7px;
+  overflow: auto;
+}
+
+#notifications-subscribe-node-options-form .follow-taxonomy .form-item {
+  border-top: 1px solid #ddd;
+  width: 250px;
+  float: left;
+}
+
+#notifications-subscribe-node-options-form .form-item label {
+  display: block;
+  margin: 0 0 0 20px;
+  font: bold 14px helvetica,arial,sans-serif;
+}
+
+#notifications-subscribe-node-options-form .follow-taxonomy p {
+  font-size: 16px;
+  line-height: 21px;
+}
+
+#notifications-subscribe-node-options-form input[type=checkbox] {
+  margin: 0 0 0 -20px;
+  width: 16px;
+}
+
+#notifications-subscribe-node-options-form .follow-node {
+  margin-bottom: 10px;
+  padding: 10px 0;
+  background-color: #F1F7F0;
+  clear: both;
+}
+
+#notifications-subscribe-node-options-form .follow-node .form-checkboxes {
+  margin: 0;
+  padding: 0;
+}
+
+#notifications-subscribe-node-options-form .follow-node p {
+  margin: -4px 30px 10px 30px;
+  font-size: 0.95em;
+}
+
+#notifications-subscribe-node-options-form .follow-subscribe-address {
+  margin-top: 20px;
+  color: #555;
+  font-size: 12px;
+  clear: both;
+}
+
+#notifications-subscribe-node-options-form .follow-subscribe-address strong {
+  font-weight: bold;
+}
+
+#notifications-subscribe-node-options-form .follow-subscribe-address a:visited {
+  color: #256FAC !important;
+}
+
+#notifications-subscribe-node-options-form .follow-controls {
+  width: 100%;
+  text-align: center;
+}
+
