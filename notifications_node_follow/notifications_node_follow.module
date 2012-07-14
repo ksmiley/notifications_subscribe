@@ -1,5 +1,4 @@
 <?php
-// $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/notifications_node_follow/notifications_node_follow.module#1 $
 /**
  * @file
  * Subscriptions to node follow-ups, using CCK nodereference fields.

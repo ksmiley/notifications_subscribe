@@ -1,4 +1,3 @@
-// $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/js/modal-override.js#1 $
 /**
  * @file
  * Backport of functions from CTools 1.8 so that the modal display is customizable.

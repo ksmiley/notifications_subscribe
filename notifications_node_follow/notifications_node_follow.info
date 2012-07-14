@@ -1,4 +1,3 @@
-; $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/notifications_node_follow/notifications_node_follow.info#1 $
 name = Node Follow-ups
 description = Subscribe to updates on a node and new nodes marked as follow-ups
 package = "Notifications"

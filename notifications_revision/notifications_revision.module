@@ -1,5 +1,4 @@
 <?php
-// $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/notifications_revision/notifications_revision.module#1 $
 /**
  * @file
  * Adds notifications event for node updates that create a new revision.

@@ -1,5 +1,4 @@
 <?php
-// $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/notifications_subscribe.module#4 $
 /**
  * @file
  * Implements SMS follow by modifying Notifications and providing a new interface.

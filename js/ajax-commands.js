@@ -1,4 +1,3 @@
-// $Id: //sms/modules/morris/notifications_subscribe/6/v2011.1/js/ajax-commands.js#1 $
 /**
  * @file
  *
