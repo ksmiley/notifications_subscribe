@@ -115,27 +115,10 @@ function notifications_node_follow_notifications($op) {
 }
 
 /**
- * Implementation of hook notifications_subscription()
- *
- * @todo Does this need more access checking? Like checking the CCK field permissions?
- */
-/* This was copied from notifications_content, but since it's generic it probably isn't
- * needed here. The version in noitifcations_content should still apply.
-function notifications_node_follow_notifications_subscription($op, $subscription = NULL) {
-  // Check access control for subscription
-  if ($op == 'access' && ($conditions = $subscription->get_conditions()) && !empty($conditions['type'])) {
-    // It seems to be a subscription for a content type
-    return notifications_content_type_enabled($conditions['type'], $subscription->type);
-  }
-}
-*/
-
-/**
  * Implementation of hook_notifications_object_node()
  */
 function notifications_node_follow_notifications_object_node($op, $node, $account = NULL) {
   switch ($op) {
-    //case 'conditions':
     case 'subscriptions':
       // Return available subscription options for this node and this user account
       $options = array();
